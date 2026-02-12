@@ -22,6 +22,7 @@ import (
 	"github.com/gofiber/fiber/v3"
 	"github.com/gofiber/fiber/v3/middleware/cache"
 	"github.com/gofiber/fiber/v3/middleware/cors"
+	"github.com/gofiber/fiber/v3/middleware/limiter"
 	"github.com/gofiber/utils/v2"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/joho/godotenv"
@@ -343,6 +344,14 @@ func main() {
 		log.Printf("[http] <-- %s %s %d %s", c.Method(), c.OriginalURL(), c.Response().StatusCode(), time.Since(start))
 		return err
 	})
+
+	app.Use(limiter.New(limiter.Config{
+		Next: func(c fiber.Ctx) bool {
+			return c.IP() == "127.0.0.1"
+		},
+		Max:        30,
+		Expiration: 5 * time.Minute,
+	}))
 
 	app.Use(cors.New(cors.Config{
 		AllowOrigins: []string{"https://discord.com"},
