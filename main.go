@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +12,8 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -130,59 +133,404 @@ func checkR2(r2 *s3.Client, bucket, userID string) bool {
 	return err == nil
 }
 
-// convertToAVIF writes the input to a temp file, converts it to AVIF via ImageMagick, and returns the result.
-// Uses temp files so ImageMagick can properly handle animated WebP and other formats.
-// Animated images (WebP, GIF) are preserved as animated AVIF (AVIS).
-func convertToAVIF(input io.Reader, inputExt string) ([]byte, error) {
-	log.Printf("[magick] starting AVIF conversion (input ext: %s)", inputExt)
+// detectFormat identifies the image/video format from magic bytes.
+// Returns "png", "jpg", "gif", "webp", "webp-anim", "avif", "mp4", or error.
+func detectFormat(data []byte) (string, error) {
+	if len(data) < 32 {
+		return "", fmt.Errorf("data too short for format detection (%d bytes)", len(data))
+	}
+
+	// PNG: \x89PNG\r\n\x1a\n
+	if data[0] == 0x89 && data[1] == 'P' && data[2] == 'N' && data[3] == 'G' &&
+		data[4] == 0x0D && data[5] == 0x0A && data[6] == 0x1A && data[7] == 0x0A {
+		return "png", nil
+	}
+
+	// JPEG: \xFF\xD8\xFF
+	if data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF {
+		return "jpg", nil
+	}
+
+	// GIF: "GIF87a" or "GIF89a"
+	if string(data[0:3]) == "GIF" && (string(data[3:6]) == "87a" || string(data[3:6]) == "89a") {
+		return "gif", nil
+	}
+
+	// WebP: RIFF at 0, WEBP at 8
+	if string(data[0:4]) == "RIFF" && string(data[8:12]) == "WEBP" {
+		// check for animation: VP8X chunk at offset 12, animation flag at byte 20 bit 1
+		if string(data[12:16]) == "VP8X" && len(data) > 20 {
+			if data[20]&0x02 != 0 {
+				return "webp-anim", nil
+			}
+		}
+		return "webp", nil
+	}
+
+	// ISOBMFF container (AVIF and MP4): "ftyp" at offset 4
+	if string(data[4:8]) == "ftyp" {
+		brand := string(data[8:12])
+		switch brand {
+		case "avif", "avis", "mif1":
+			return "avif", nil
+		case "isom", "mp41", "mp42", "M4V ", "M4A ", "f4v ", "kddi", "mp71":
+			return "mp4", nil
+		default:
+			// some MP4 files use other brands
+			if strings.HasPrefix(brand, "mp4") {
+				return "mp4", nil
+			}
+		}
+	}
+
+	return "", fmt.Errorf("unsupported format (magic bytes: %x)", data[:16])
+}
+
+// convertToAVIF routes the input data to the appropriate converter based on format.
+func convertToAVIF(input []byte, format string) ([]byte, error) {
+	log.Printf("[convert] converting %d bytes, format=%s", len(input), format)
 	start := time.Now()
 
-	// write input to a temp file so ImageMagick can read it properly
-	tmpIn, err := os.CreateTemp("", "avatar-in-*"+inputExt)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create temp input file: %w", err)
-	}
-	defer os.Remove(tmpIn.Name())
-	defer tmpIn.Close()
+	var result []byte
+	var err error
 
-	written, err := io.Copy(tmpIn, input)
-	if err != nil {
-		return nil, fmt.Errorf("failed to write temp input file: %w", err)
+	switch format {
+	case "avif":
+		log.Printf("[convert] AVIF passthrough, no conversion needed")
+		return input, nil
+	case "png", "jpg", "webp":
+		result, err = convertStaticToAVIF(input, format)
+	case "gif":
+		result, err = convertGIFToAVIF(input)
+	case "webp-anim":
+		result, err = convertAnimatedWebPToAVIF(input)
+	case "mp4":
+		result, err = convertMP4ToAVIF(input)
+	default:
+		return nil, fmt.Errorf("unsupported format: %s", format)
 	}
-	tmpIn.Close()
-	log.Printf("[magick] wrote %d bytes to temp input %s", written, tmpIn.Name())
 
-	tmpOut, err := os.CreateTemp("", "avatar-out-*.avif")
 	if err != nil {
-		return nil, fmt.Errorf("failed to create temp output file: %w", err)
+		return nil, err
 	}
-	defer os.Remove(tmpOut.Name())
-	tmpOut.Close()
 
-	// -coalesce expands animated frames so each is a full image (needed for proper animation conversion)
-	// all frames are kept so the output AVIF is animated
-	cmd := exec.Command("magick",
-		tmpIn.Name(),
-		"-coalesce",
-		"-quality", "50",
-		tmpOut.Name(),
+	log.Printf("[convert] done in %s, output=%d bytes", time.Since(start), len(result))
+	return result, nil
+}
+
+// convertStaticToAVIF converts a static image (PNG, JPG, static WebP) to a still AVIF.
+func convertStaticToAVIF(input []byte, ext string) ([]byte, error) {
+	tmpDir, err := os.MkdirTemp("", "avif-static-*")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp dir: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	inPath := filepath.Join(tmpDir, "input."+ext)
+	outPath := filepath.Join(tmpDir, "output.avif")
+
+	if err := os.WriteFile(inPath, input, 0644); err != nil {
+		return nil, fmt.Errorf("failed to write temp input: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "ffmpeg", "-y",
+		"-i", inPath,
+		"-c:v", "libaom-av1",
+		"-crf", "30",
+		"-still-picture", "1",
+		outPath,
 	)
-
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
+	log.Printf("[ffmpeg] running: ffmpeg -y -i input.%s -c:v libaom-av1 -crf 30 -still-picture 1 output.avif", ext)
 	if err := cmd.Run(); err != nil {
-		log.Printf("[magick] conversion failed: %v\n%s", err, stderr.String())
-		return nil, fmt.Errorf("magick: %w: %s", err, stderr.String())
+		return nil, fmt.Errorf("ffmpeg static conversion failed: %w: %s", err, stderr.String())
 	}
 
-	avifData, err := os.ReadFile(tmpOut.Name())
+	return os.ReadFile(outPath)
+}
+
+// convertGIFToAVIF converts a GIF (static or animated) to AVIF using ffmpeg.
+// Uses -vsync vfr to preserve original per-frame timing and yuva420p for transparency.
+func convertGIFToAVIF(input []byte) ([]byte, error) {
+	tmpDir, err := os.MkdirTemp("", "avif-gif-*")
 	if err != nil {
-		return nil, fmt.Errorf("failed to read converted file: %w", err)
+		return nil, fmt.Errorf("failed to create temp dir: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	inPath := filepath.Join(tmpDir, "input.gif")
+	outPath := filepath.Join(tmpDir, "output.avif")
+
+	if err := os.WriteFile(inPath, input, 0644); err != nil {
+		return nil, fmt.Errorf("failed to write temp input: %w", err)
 	}
 
-	log.Printf("[magick] conversion complete in %s, output size: %d bytes", time.Since(start), len(avifData))
-	return avifData, nil
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// GIF uses pal8 with 1-bit transparency. We need to:
+	// 1. Decode to rgba to get proper alpha channel
+	// 2. Use yuva420p to preserve alpha in output
+	// 3. Use vfr to preserve per-frame timing
+	cmd := exec.CommandContext(ctx, "ffmpeg", "-y",
+		"-i", inPath,
+		"-vf", "format=rgba",
+		"-c:v", "libaom-av1",
+		"-crf", "30",
+		"-pix_fmt", "yuva420p",
+		"-vsync", "vfr",
+		outPath,
+	)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	log.Printf("[ffmpeg] converting GIF to AVIF (rgba→yuva420p + vfr)")
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("ffmpeg GIF conversion failed: %w: %s", err, stderr.String())
+	}
+
+	return os.ReadFile(outPath)
+}
+
+// parseWebPFrameDurations parses the animated WebP binary format and extracts
+// per-frame durations from ANMF chunks. Returns one duration per frame.
+func parseWebPFrameDurations(data []byte) ([]time.Duration, error) {
+	if len(data) < 12 {
+		return nil, fmt.Errorf("data too short for WebP")
+	}
+
+	var durations []time.Duration
+	// skip RIFF header (12 bytes: "RIFF" + size + "WEBP")
+	pos := 12
+
+	for pos+8 <= len(data) {
+		tag := string(data[pos : pos+4])
+		chunkSize := int(binary.LittleEndian.Uint32(data[pos+4 : pos+8]))
+		chunkDataStart := pos + 8
+
+		if tag == "ANMF" {
+			// ANMF chunk data layout:
+			// bytes 0-2: X offset (3 bytes LE)
+			// bytes 3-5: Y offset (3 bytes LE)
+			// bytes 6-8: width-1  (3 bytes LE)
+			// bytes 9-11: height-1 (3 bytes LE)
+			// bytes 12-14: duration in ms (3 bytes LE, 24-bit uint)
+			// byte 15: flags
+			if chunkSize >= 16 && chunkDataStart+15 <= len(data) {
+				durMs := uint32(data[chunkDataStart+12]) |
+					uint32(data[chunkDataStart+13])<<8 |
+					uint32(data[chunkDataStart+14])<<16
+				dur := time.Duration(durMs) * time.Millisecond
+				// clamp 0ms to 100ms (same convention as GIF)
+				if dur == 0 {
+					dur = 100 * time.Millisecond
+				}
+				durations = append(durations, dur)
+			}
+		}
+
+		// advance to next chunk (chunks are padded to even size)
+		advance := 8 + chunkSize
+		if chunkSize%2 != 0 {
+			advance++
+		}
+		pos += advance
+	}
+
+	if len(durations) == 0 {
+		return nil, fmt.Errorf("no ANMF chunks found in WebP")
+	}
+
+	log.Printf("[webp-parse] found %d frames, durations: %v", len(durations), durations)
+	return durations, nil
+}
+
+// writeFFmpegConcatFile creates an ffmpeg concat demuxer file with per-frame durations.
+func writeFFmpegConcatFile(concatPath string, frameFiles []string, durations []time.Duration) error {
+	var buf bytes.Buffer
+	buf.WriteString("ffconcat version 1.0\n")
+
+	for i, name := range frameFiles {
+		buf.WriteString(fmt.Sprintf("file '%s'\n", name))
+		if i < len(durations) {
+			// duration in seconds as a decimal
+			buf.WriteString(fmt.Sprintf("duration %.3f\n", durations[i].Seconds()))
+		}
+	}
+
+	return os.WriteFile(concatPath, buf.Bytes(), 0644)
+}
+
+// convertAnimatedWebPToAVIF converts an animated WebP to animated AVIF using anim_dump + ffmpeg.
+func convertAnimatedWebPToAVIF(input []byte) ([]byte, error) {
+	tmpDir, err := os.MkdirTemp("", "avif-anim-*")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp dir: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	inPath := filepath.Join(tmpDir, "input.webp")
+	framesDir := filepath.Join(tmpDir, "frames")
+	outPath := filepath.Join(tmpDir, "output.avif")
+
+	if err := os.Mkdir(framesDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create frames dir: %w", err)
+	}
+
+	if err := os.WriteFile(inPath, input, 0644); err != nil {
+		return nil, fmt.Errorf("failed to write temp input: %w", err)
+	}
+
+	// Step 1: extract frames with anim_dump
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel1()
+
+	dumpCmd := exec.CommandContext(ctx1, "anim_dump", "-folder", framesDir, "-prefix", "frame", inPath)
+	var dumpStdout, dumpStderr bytes.Buffer
+	dumpCmd.Stdout = &dumpStdout
+	dumpCmd.Stderr = &dumpStderr
+
+	log.Printf("[anim_dump] extracting frames from animated WebP")
+	if err := dumpCmd.Run(); err != nil {
+		return nil, fmt.Errorf("anim_dump failed: %w: %s", err, dumpStderr.String())
+	}
+	log.Printf("[anim_dump] output: %s", dumpStdout.String())
+
+	// list extracted frames to determine the pattern
+	entries, err := os.ReadDir(framesDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read frames dir: %w", err)
+	}
+
+	var frameFiles []string
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(strings.ToLower(e.Name()), ".png") {
+			frameFiles = append(frameFiles, e.Name())
+		}
+	}
+
+	if len(frameFiles) == 0 {
+		return nil, fmt.Errorf("anim_dump produced no frames")
+	}
+
+	sort.Strings(frameFiles)
+	log.Printf("[anim_dump] extracted %d frames, first=%s last=%s", len(frameFiles), frameFiles[0], frameFiles[len(frameFiles)-1])
+
+	// rename frames to sequential numbering for ffmpeg
+	for i, name := range frameFiles {
+		oldPath := filepath.Join(framesDir, name)
+		newPath := filepath.Join(framesDir, fmt.Sprintf("frame_%04d.png", i+1))
+		if oldPath != newPath {
+			if err := os.Rename(oldPath, newPath); err != nil {
+				return nil, fmt.Errorf("failed to rename frame %s: %w", name, err)
+			}
+		}
+	}
+
+	// parse per-frame durations from the WebP binary
+	durations, durErr := parseWebPFrameDurations(input)
+	if durErr != nil {
+		log.Printf("[anim_dump] could not parse frame durations: %v, falling back to 100ms/frame", durErr)
+		durations = make([]time.Duration, len(frameFiles))
+		for i := range durations {
+			durations[i] = 100 * time.Millisecond
+		}
+	}
+
+	// if frame count mismatch, distribute total duration evenly
+	if len(durations) != len(frameFiles) {
+		log.Printf("[anim_dump] duration count (%d) != frame count (%d), redistributing evenly", len(durations), len(frameFiles))
+		var total time.Duration
+		for _, d := range durations {
+			total += d
+		}
+		perFrame := total / time.Duration(len(frameFiles))
+		if perFrame < 10*time.Millisecond {
+			perFrame = 100 * time.Millisecond
+		}
+		durations = make([]time.Duration, len(frameFiles))
+		for i := range durations {
+			durations[i] = perFrame
+		}
+	}
+
+	// build renamed frame file list for the concat file
+	renamedFrames := make([]string, len(frameFiles))
+	for i := range frameFiles {
+		renamedFrames[i] = fmt.Sprintf("frame_%04d.png", i+1)
+	}
+
+	// Step 2: write concat demuxer file with per-frame durations
+	concatPath := filepath.Join(framesDir, "concat.txt")
+	if err := writeFFmpegConcatFile(concatPath, renamedFrames, durations); err != nil {
+		return nil, fmt.Errorf("failed to write concat file: %w", err)
+	}
+
+	// Step 3: encode frames to animated AVIF with ffmpeg using concat demuxer
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel2()
+
+	cmd := exec.CommandContext(ctx2, "ffmpeg", "-y",
+		"-f", "concat",
+		"-safe", "0",
+		"-i", concatPath,
+		"-c:v", "libaom-av1",
+		"-crf", "30",
+		"-pix_fmt", "yuv420p",
+		"-vsync", "vfr",
+		outPath,
+	)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	log.Printf("[ffmpeg] encoding %d frames to animated AVIF with per-frame timing", len(frameFiles))
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("ffmpeg animated conversion failed: %w: %s", err, stderr.String())
+	}
+
+	return os.ReadFile(outPath)
+}
+
+// convertMP4ToAVIF converts an MP4 video to animated AVIF.
+func convertMP4ToAVIF(input []byte) ([]byte, error) {
+	tmpDir, err := os.MkdirTemp("", "avif-mp4-*")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp dir: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	inPath := filepath.Join(tmpDir, "input.mp4")
+	outPath := filepath.Join(tmpDir, "output.avif")
+
+	if err := os.WriteFile(inPath, input, 0644); err != nil {
+		return nil, fmt.Errorf("failed to write temp input: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "ffmpeg", "-y",
+		"-i", inPath,
+		"-c:v", "libaom-av1",
+		"-crf", "30",
+		"-pix_fmt", "yuv420p",
+		"-an",
+		outPath,
+	)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	log.Printf("[ffmpeg] converting MP4 to animated AVIF")
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("ffmpeg MP4 conversion failed: %w: %s", err, stderr.String())
+	}
+
+	return os.ReadFile(outPath)
 }
 
 func newR2Client() *s3.Client {
@@ -313,6 +661,17 @@ func main() {
 	} else {
 		log.Println("[config] loaded .env file")
 	}
+
+	// verify required CLI tools are available
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		log.Fatal("[config] ffmpeg not found on PATH — required for AVIF conversion")
+	}
+	log.Println("[config] ffmpeg found")
+
+	if _, err := exec.LookPath("anim_dump"); err != nil {
+		log.Fatal("[config] anim_dump not found on PATH — required for animated WebP conversion (install libwebp-tools)")
+	}
+	log.Println("[config] anim_dump found")
 
 	bucket := os.Getenv("R2_BUCKET_NAME")
 	if bucket == "" {
@@ -567,19 +926,37 @@ func main() {
 		}
 		defer src.Close()
 
-		//avifData, err := convertToAVIF(src, ext)
-		//if err != nil {
-		//	log.Printf("[upload] user %s: AVIF conversion failed: %v", userId, err)
-		//	return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-		//		"error": "failed to convert image to AVIF",
-		//	})
-		//}
+		data, err := io.ReadAll(src)
+		if err != nil {
+			log.Printf("[upload] user %s: failed to read file bytes: %v", userId, err)
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "failed to read uploaded file",
+			})
+		}
+		log.Printf("[upload] user %s: read %d bytes from upload", userId, len(data))
 
-		log.Printf("[upload] user %s: uploading to R2 key %q", userId, key)
+		format, err := detectFormat(data)
+		if err != nil {
+			log.Printf("[upload] user %s: unsupported format: %v", userId, err)
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": "unsupported file format — accepted: PNG, JPG, GIF, WebP, AVIF, MP4",
+			})
+		}
+		log.Printf("[upload] user %s: detected format=%s", userId, format)
+
+		avifData, err := convertToAVIF(data, format)
+		if err != nil {
+			log.Printf("[upload] user %s: AVIF conversion failed: %v", userId, err)
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "failed to convert image to AVIF",
+			})
+		}
+
+		log.Printf("[upload] user %s: uploading %d bytes to R2 key %q", userId, len(avifData), key)
 		_, err = r2.PutObject(context.TODO(), &s3.PutObjectInput{
 			Bucket:      aws.String(bucket),
 			Key:         aws.String(key),
-			Body:        src,
+			Body:        bytes.NewReader(avifData),
 			ContentType: aws.String("image/avif"),
 		})
 		if err != nil {
