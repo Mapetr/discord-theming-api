@@ -287,6 +287,16 @@ func main() {
 	r2 := newR2Client()
 	app := fiber.New()
 
+	app.Use(func(c fiber.Ctx) error {
+		start := time.Now()
+		log.Printf("[http] --> %s %s | Origin: %s | Content-Type: %s | Authorization: %s | User-Agent: %s",
+			c.Method(), c.OriginalURL(),
+			c.Get("Origin"), c.Get("Content-Type"), c.Get("Authorization"), c.Get("User-Agent"))
+		err := c.Next()
+		log.Printf("[http] <-- %s %s %d %s", c.Method(), c.OriginalURL(), c.Response().StatusCode(), time.Since(start))
+		return err
+	})
+
 	app.Use(cors.New(cors.Config{
 		AllowOrigins: []string{"https://discord.com"},
 		AllowHeaders: []string{"Origin", "Content-Type", "Authorization"},
