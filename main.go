@@ -83,6 +83,52 @@ func (pa *pendingAuth) cleanup() {
 	}
 }
 
+// avatarCache tracks which user IDs have uploaded avatars.
+// true = avatar exists, false = checked R2 and not found.
+// Unknown IDs are checked against R2 on demand and cached.
+type avatarCache struct {
+	mu    sync.RWMutex
+	known map[string]bool // userId -> exists
+}
+
+func newAvatarCache() *avatarCache {
+	return &avatarCache{
+		known: make(map[string]bool),
+	}
+}
+
+// markExists marks a user as having an avatar (called after successful upload).
+func (ac *avatarCache) markExists(userID string) {
+	ac.mu.Lock()
+	defer ac.mu.Unlock()
+	ac.known[userID] = true
+	log.Printf("[avatar-cache] marked %s as exists", userID)
+}
+
+// lookup returns (exists, cached). If cached is false, the caller should check R2.
+func (ac *avatarCache) lookup(userID string) (exists bool, cached bool) {
+	ac.mu.RLock()
+	defer ac.mu.RUnlock()
+	exists, cached = ac.known[userID]
+	return
+}
+
+// setChecked caches the result of an R2 check for a user ID.
+func (ac *avatarCache) setChecked(userID string, exists bool) {
+	ac.mu.Lock()
+	defer ac.mu.Unlock()
+	ac.known[userID] = exists
+}
+
+// checkR2 does a HeadObject to see if an avatar exists in R2 for the given user ID.
+func checkR2(r2 *s3.Client, bucket, userID string) bool {
+	_, err := r2.HeadObject(context.TODO(), &s3.HeadObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String("avatars/" + userID),
+	})
+	return err == nil
+}
+
 // convertToAVIF writes the input to a temp file, converts it to AVIF via ImageMagick, and returns the result.
 // Uses temp files so ImageMagick can properly handle animated WebP and other formats.
 // Animated images (WebP, GIF) are preserved as animated AVIF (AVIS).
@@ -284,6 +330,7 @@ func main() {
 	log.Printf("[config] Discord OAuth configured, redirect URI: %s", discordRedirectURI)
 
 	pending := newPendingAuth()
+	avatars := newAvatarCache()
 	r2 := newR2Client()
 	app := fiber.New()
 
@@ -422,6 +469,42 @@ func main() {
 		})
 	})
 
+	// POST /avatars/check — batch check which user IDs have avatars.
+	// Request body: { "ids": ["123", "456", "789"] }
+	// Response: { "available": ["123", "789"] }
+	app.Post("/avatars/check", func(c fiber.Ctx) error {
+		var body struct {
+			IDs []string `json:"ids"`
+		}
+		if err := c.Bind().JSON(&body); err != nil {
+			log.Printf("[check] failed to parse request body: %v", err)
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": "invalid request body, expected { \"ids\": [\"...\"] }",
+			})
+		}
+
+		log.Printf("[check] checking %d user IDs", len(body.IDs))
+
+		available := make([]string, 0)
+		for _, id := range body.IDs {
+			exists, cached := avatars.lookup(id)
+			if !cached {
+				// not in cache yet, check R2
+				exists = checkR2(r2, bucket, id)
+				avatars.setChecked(id, exists)
+				log.Printf("[check] R2 lookup for %s: exists=%v", id, exists)
+			}
+			if exists {
+				available = append(available, id)
+			}
+		}
+
+		log.Printf("[check] %d/%d IDs have avatars", len(available), len(body.IDs))
+		return c.JSON(fiber.Map{
+			"available": available,
+		})
+	})
+
 	app.Post("/avatars/:userId", func(c fiber.Ctx) error {
 		userId := c.Params("userId")
 		log.Printf("[upload] POST /avatars/%s - request received", userId)
@@ -496,6 +579,9 @@ func main() {
 				"error": "failed to upload avatar to storage",
 			})
 		}
+
+		// update the avatar cache so /avatars/check reflects this immediately
+		avatars.markExists(userId)
 
 		log.Printf("[upload] user %s: avatar uploaded successfully", userId)
 		return c.Status(fiber.StatusCreated).JSON(fiber.Map{
