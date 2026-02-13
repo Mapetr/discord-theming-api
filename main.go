@@ -24,6 +24,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/gofiber/contrib/v3/websocket"
 	"github.com/gofiber/fiber/v3"
 	"github.com/gofiber/fiber/v3/middleware/cache"
 	"github.com/gofiber/fiber/v3/middleware/cors"
@@ -89,13 +90,80 @@ func (pa *pendingAuth) cleanup() {
 	}
 }
 
+// wsHub manages WebSocket client connections and broadcasts avatar changes.
+type wsHub struct {
+	mu      sync.RWMutex
+	clients map[*websocket.Conn]bool
+}
+
+func newWSHub() *wsHub {
+	return &wsHub{
+		clients: make(map[*websocket.Conn]bool),
+	}
+}
+
+func (h *wsHub) register(conn *websocket.Conn) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.clients[conn] = true
+	log.Printf("[ws] client connected (%d total)", len(h.clients))
+}
+
+func (h *wsHub) unregister(conn *websocket.Conn) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	delete(h.clients, conn)
+	log.Printf("[ws] client disconnected (%d remaining)", len(h.clients))
+}
+
+// broadcast sends a JSON message to all connected WebSocket clients.
+// Failed sends cause the client to be removed.
+func (h *wsHub) broadcast(msg []byte) {
+	h.mu.RLock()
+	clients := make([]*websocket.Conn, 0, len(h.clients))
+	for c := range h.clients {
+		clients = append(clients, c)
+	}
+	h.mu.RUnlock()
+
+	var failed []*websocket.Conn
+	for _, c := range clients {
+		if err := c.WriteMessage(websocket.TextMessage, msg); err != nil {
+			log.Printf("[ws] write failed, removing client: %v", err)
+			failed = append(failed, c)
+		}
+	}
+
+	if len(failed) > 0 {
+		h.mu.Lock()
+		for _, c := range failed {
+			delete(h.clients, c)
+			c.Close()
+		}
+		h.mu.Unlock()
+	}
+}
+
+const maxChangelogEntries = 1000
+
+// changeEntry represents a single mutation in the avatar cache changelog.
+type changeEntry struct {
+	Version uint64
+	UserID  string
+	Hash    string
+}
+
 // avatarCache tracks which user IDs have uploaded avatars and their content hashes.
-// Positive entries (hash != "") are persisted to a file and loaded on startup.
+// Positive entries (hash != "") are persisted to a versioned file and loaded on startup.
 // Negative entries (hash == "", checked R2 and not found) are in-memory only.
+// A bounded changelog enables incremental sync for clients.
 type avatarCache struct {
-	mu       sync.RWMutex
-	known    map[string]string // userId -> content hash ("" = not found, non-empty = exists)
-	filePath string
+	mu          sync.RWMutex
+	known       map[string]string // userId -> content hash ("" = not found, non-empty = exists)
+	version     uint64            // monotonically increasing, increments on each persisted mutation
+	changelog   []changeEntry     // bounded in-memory log of recent mutations
+	filePath    string
+	broadcastFn func(version uint64, userID, hash string) // called after each mutation to notify WS clients
 }
 
 func newAvatarCache(filePath string) *avatarCache {
@@ -115,7 +183,30 @@ func newAvatarCache(filePath string) *avatarCache {
 	}
 
 	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-	for _, line := range lines {
+	if len(lines) == 0 {
+		return ac
+	}
+
+	startIdx := 0
+	migrationNeeded := false
+
+	// check if first line is a version header
+	if strings.HasPrefix(lines[0], "version:") {
+		vStr := strings.TrimPrefix(lines[0], "version:")
+		v, err := strconv.ParseUint(vStr, 10, 64)
+		if err != nil {
+			log.Printf("[avatar-cache] invalid version line %q, treating as version 0", lines[0])
+		} else {
+			ac.version = v
+		}
+		startIdx = 1
+	} else {
+		// old format — needs migration
+		ac.version = 1
+		migrationNeeded = true
+	}
+
+	for _, line := range lines[startIdx:] {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
@@ -128,36 +219,68 @@ func newAvatarCache(filePath string) *avatarCache {
 			ac.known[parts[0]] = "unknown"
 		}
 	}
-	log.Printf("[avatar-cache] loaded %d user IDs from %s", len(ac.known), filePath)
+
+	log.Printf("[avatar-cache] loaded %d user IDs from %s (version %d)", len(ac.known), filePath, ac.version)
+
+	if migrationNeeded {
+		ac.rewriteFile()
+		log.Printf("[avatar-cache] migrated file to new format with version %d", ac.version)
+	}
 
 	return ac
 }
 
+// rewriteFile writes the current state to disk. Must be called with ac.mu held.
+func (ac *avatarCache) rewriteFile() {
+	var buf bytes.Buffer
+	buf.WriteString(fmt.Sprintf("version:%d\n", ac.version))
+
+	for userID, hash := range ac.known {
+		if hash != "" {
+			buf.WriteString(userID + ":" + hash + "\n")
+		}
+	}
+
+	if err := os.WriteFile(ac.filePath, buf.Bytes(), 0644); err != nil {
+		log.Printf("[avatar-cache] failed to rewrite cache file: %v", err)
+	}
+}
+
 // markExists marks a user as having an avatar with the given content hash.
-// Persists to disk. Skips write if the hash hasn't changed.
+// Increments version, appends to changelog, rewrites file, and broadcasts to WS clients.
 func (ac *avatarCache) markExists(userID string, hash string) {
 	ac.mu.Lock()
-	defer ac.mu.Unlock()
 
 	if ac.known[userID] == hash {
+		ac.mu.Unlock()
 		return
 	}
 
 	ac.known[userID] = hash
+	ac.version++
+	version := ac.version
 
-	f, err := os.OpenFile(ac.filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		log.Printf("[avatar-cache] failed to open cache file for append: %v", err)
-		return
+	ac.changelog = append(ac.changelog, changeEntry{
+		Version: ac.version,
+		UserID:  userID,
+		Hash:    hash,
+	})
+
+	if len(ac.changelog) > maxChangelogEntries {
+		ac.changelog = ac.changelog[len(ac.changelog)-maxChangelogEntries:]
 	}
-	defer f.Close()
 
-	if _, err := f.WriteString(userID + ":" + hash + "\n"); err != nil {
-		log.Printf("[avatar-cache] failed to write to cache file: %v", err)
-		return
+	ac.rewriteFile()
+
+	broadcastFn := ac.broadcastFn
+	ac.mu.Unlock()
+
+	log.Printf("[avatar-cache] marked %s with hash %s (version %d)", userID, hash, version)
+
+	// broadcast outside the lock to avoid holding it during network I/O
+	if broadcastFn != nil {
+		broadcastFn(version, userID, hash)
 	}
-
-	log.Printf("[avatar-cache] marked %s with hash %s (persisted)", userID, hash)
 }
 
 // lookup returns (hash, cached). If cached is false, the caller should check R2.
@@ -169,12 +292,45 @@ func (ac *avatarCache) lookup(userID string) (hash string, cached bool) {
 	return
 }
 
-// setChecked caches the result of an R2 check for a user ID.
+// setChecked caches the result of an R2 check for a user ID (in-memory only).
 // Pass "unknown" for positive results (no hash available), "" for negative results.
+// Does NOT touch version or changelog — this is ephemeral R2 lookup caching.
 func (ac *avatarCache) setChecked(userID string, hash string) {
 	ac.mu.Lock()
 	defer ac.mu.Unlock()
 	ac.known[userID] = hash
+}
+
+// sync returns changes since the given version. If the version is too old
+// or zero, returns a full snapshot of all known avatars.
+func (ac *avatarCache) sync(sinceVersion uint64) (version uint64, changes []changeEntry, full bool) {
+	ac.mu.RLock()
+	defer ac.mu.RUnlock()
+
+	version = ac.version
+
+	// can we serve incrementally?
+	canIncremental := sinceVersion > 0 && len(ac.changelog) > 0 && sinceVersion >= ac.changelog[0].Version
+
+	if !canIncremental {
+		// full snapshot
+		full = true
+		changes = make([]changeEntry, 0, len(ac.known))
+		for userID, hash := range ac.known {
+			if hash != "" {
+				changes = append(changes, changeEntry{UserID: userID, Hash: hash})
+			}
+		}
+		return
+	}
+
+	// incremental: return only changes after sinceVersion
+	for _, entry := range ac.changelog {
+		if entry.Version > sinceVersion {
+			changes = append(changes, entry)
+		}
+	}
+	return
 }
 
 // checkR2 does a HeadObject to see if an avatar exists in R2 for the given user ID.
@@ -744,8 +900,20 @@ func main() {
 
 	pending := newPendingAuth()
 	avatars := newAvatarCache("avatars.txt")
+	hub := newWSHub()
 	r2 := newR2Client()
 	app := fiber.New()
+
+	// wire avatar cache mutations to broadcast via WebSocket
+	avatars.broadcastFn = func(version uint64, userID, hash string) {
+		msg, _ := json.Marshal(fiber.Map{
+			"type":    "update",
+			"version": version,
+			"userId":  userID,
+			"hash":    hash,
+		})
+		hub.broadcast(msg)
+	}
 
 	app.Use(func(c fiber.Ctx) error {
 		start := time.Now()
@@ -779,8 +947,8 @@ func main() {
 			return utils.CopyString(c.Path() + "?" + string(c.Request().URI().QueryString()))
 		},
 		Next: func(c fiber.Ctx) bool {
-			// skip cache for auth routes and POST requests
-			return strings.HasPrefix(c.Path(), "/auth") || c.Method() == "POST"
+			// skip cache for auth routes, POST requests, and websocket
+			return strings.HasPrefix(c.Path(), "/auth") || c.Method() == "POST" || c.Path() == "/avatars/ws"
 		},
 	}))
 
@@ -890,103 +1058,150 @@ func main() {
 		})
 	})
 
-	// GET /auth/verify — check if a JWT is valid and whether it has expired.
-	// Requires Authorization: Bearer <token> header.
-	// Response: { "valid": true, "expired": false, "userId": "...", "expiresAt": "..." }
-	app.Get("/auth/verify", func(c fiber.Ctx) error {
-		authHeader := c.Get("Authorization")
-		if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
-			log.Println("[auth] /auth/verify called without Bearer token")
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-				"error": "Authorization: Bearer <token> header is required",
-			})
+	// GET /avatars/ws — WebSocket endpoint for real-time avatar updates.
+	// No authentication required. Sends initial full state on connect, then pushes incremental changes.
+	// Compatible with any WebSocket client (e.g. Node.js `ws` package).
+	//
+	// Messages from server (push):
+	//   Initial: { "type": "sync", "version": N, "full": true, "changes": [...] }
+	//   Update:  { "type": "update", "version": N, "userId": "...", "hash": "..." }
+	//   Error:   { "type": "error", "error": "..." }
+	//
+	// Client can send:
+	//   Ping:    { "type": "ping" }
+	//            -> { "type": "pong" }
+	//
+	//   Check:   { "type": "check", "ids": ["123", "456"] }
+	//            -> { "type": "check", "available": { "123": "hash", "456": "hash" } }
+	//
+	//   Verify:  { "type": "verify", "token": "<jwt>" }
+	//            -> { "type": "verify", "valid": true, "expired": false, "userId": "...", "expiresAt": "..." }
+	app.Get("/avatars/ws", websocket.New(func(c *websocket.Conn) {
+		// register this client
+		hub.register(c)
+		defer hub.unregister(c)
+
+		// send initial full snapshot
+		version, changes, _ := avatars.sync(0)
+		type syncChange struct {
+			UserID string `json:"userId"`
+			Hash   string `json:"hash"`
 		}
-
-		tokenString := strings.TrimPrefix(authHeader, "Bearer ")
-
-		// first try: full validation (including expiration)
-		keyFunc := func(t *jwt.Token) (any, error) {
-			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-				return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
-			}
-			return []byte(jwtSecret), nil
+		respChanges := make([]syncChange, len(changes))
+		for i, ch := range changes {
+			respChanges[i] = syncChange{UserID: ch.UserID, Hash: ch.Hash}
 		}
-
-		token, err := jwt.Parse(tokenString, keyFunc)
-		if err == nil {
-			// token is valid and not expired
-			sub, _ := token.Claims.GetSubject()
-			exp, _ := token.Claims.GetExpirationTime()
-			log.Printf("[auth] verify: valid token for user %s, expires %s", sub, exp.Time)
-			return c.JSON(fiber.Map{
-				"valid":     true,
-				"expired":   false,
-				"userId":    sub,
-				"expiresAt": exp.Time,
-			})
-		}
-
-		// second try: skip claims validation to check if signature is valid but token is expired
-		token, err2 := jwt.Parse(tokenString, keyFunc, jwt.WithoutClaimsValidation())
-		if err2 != nil {
-			// signature invalid or token is malformed
-			log.Printf("[auth] verify: invalid token: %v", err)
-			return c.JSON(fiber.Map{
-				"valid": false,
-				"error": "invalid token",
-			})
-		}
-
-		// signature is valid but token failed standard validation (expired)
-		sub, _ := token.Claims.GetSubject()
-		exp, _ := token.Claims.GetExpirationTime()
-		log.Printf("[auth] verify: expired token for user %s, expired at %s", sub, exp.Time)
-		return c.JSON(fiber.Map{
-			"valid":     true,
-			"expired":   true,
-			"userId":    sub,
-			"expiresAt": exp.Time,
+		initMsg, _ := json.Marshal(fiber.Map{
+			"type":    "sync",
+			"version": version,
+			"full":    true,
+			"changes": respChanges,
 		})
-	})
-
-	// POST /avatars/check — batch check which user IDs have avatars.
-	// Request body: { "ids": ["123", "456", "789"] }
-	// Response: { "available": { "123": "a1b2c3d4e5f6a7b8", "789": "unknown" } }
-	app.Post("/avatars/check", func(c fiber.Ctx) error {
-		var body struct {
-			IDs []string `json:"ids"`
-		}
-		if err := c.Bind().JSON(&body); err != nil {
-			log.Printf("[check] failed to parse request body: %v", err)
-			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-				"error": "invalid request body, expected { \"ids\": [\"...\"] }",
-			})
+		if err := c.WriteMessage(websocket.TextMessage, initMsg); err != nil {
+			log.Printf("[ws] failed to send initial sync: %v", err)
+			return
 		}
 
-		log.Printf("[check] checking %d user IDs", len(body.IDs))
+		// read loop — keeps connection alive and handles client messages
+		for {
+			_, msg, err := c.ReadMessage()
+			if err != nil {
+				break
+			}
 
-		available := make(map[string]string)
-		for _, id := range body.IDs {
-			hash, cached := avatars.lookup(id)
-			if !cached {
-				// not in cache yet, check R2
-				exists := checkR2(r2, bucket, id)
-				if exists {
-					hash = "unknown"
+			var clientMsg struct {
+				Type  string   `json:"type"`
+				IDs   []string `json:"ids,omitempty"`
+				Token string   `json:"token,omitempty"`
+			}
+			if json.Unmarshal(msg, &clientMsg) != nil {
+				continue
+			}
+
+			var reply []byte
+
+			switch clientMsg.Type {
+			case "ping":
+				reply, _ = json.Marshal(fiber.Map{"type": "pong"})
+
+			case "check":
+				available := make(map[string]string)
+				for _, id := range clientMsg.IDs {
+					hash, cached := avatars.lookup(id)
+					if !cached {
+						exists := checkR2(r2, bucket, id)
+						if exists {
+							hash = "unknown"
+						}
+						avatars.setChecked(id, hash)
+					}
+					if hash != "" {
+						available[id] = hash
+					}
 				}
-				avatars.setChecked(id, hash)
-				log.Printf("[check] R2 lookup for %s: exists=%v", id, exists)
+				reply, _ = json.Marshal(fiber.Map{
+					"type":      "check",
+					"available": available,
+				})
+
+			case "verify":
+				if clientMsg.Token == "" {
+					reply, _ = json.Marshal(fiber.Map{
+						"type":  "verify",
+						"valid": false,
+						"error": "token field is required",
+					})
+				} else {
+					keyFunc := func(t *jwt.Token) (any, error) {
+						if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+							return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+						}
+						return []byte(jwtSecret), nil
+					}
+
+					tok, err := jwt.Parse(clientMsg.Token, keyFunc)
+					if err == nil {
+						sub, _ := tok.Claims.GetSubject()
+						exp, _ := tok.Claims.GetExpirationTime()
+						reply, _ = json.Marshal(fiber.Map{
+							"type":      "verify",
+							"valid":     true,
+							"expired":   false,
+							"userId":    sub,
+							"expiresAt": exp.Time,
+						})
+					} else {
+						// check if signature is valid but expired
+						tok, err2 := jwt.Parse(clientMsg.Token, keyFunc, jwt.WithoutClaimsValidation())
+						if err2 != nil {
+							reply, _ = json.Marshal(fiber.Map{
+								"type":  "verify",
+								"valid": false,
+								"error": "invalid token",
+							})
+						} else {
+							sub, _ := tok.Claims.GetSubject()
+							exp, _ := tok.Claims.GetExpirationTime()
+							reply, _ = json.Marshal(fiber.Map{
+								"type":      "verify",
+								"valid":     true,
+								"expired":   true,
+								"userId":    sub,
+								"expiresAt": exp.Time,
+							})
+						}
+					}
+				}
+
+			default:
+				continue
 			}
-			if hash != "" {
-				available[id] = hash
+
+			if err := c.WriteMessage(websocket.TextMessage, reply); err != nil {
+				break
 			}
 		}
-
-		log.Printf("[check] %d/%d IDs have avatars", len(available), len(body.IDs))
-		return c.JSON(fiber.Map{
-			"available": available,
-		})
-	})
+	}))
 
 	app.Post("/avatars/:userId", func(c fiber.Ctx) error {
 		userId := c.Params("userId")
@@ -1059,39 +1274,38 @@ func main() {
 		}
 		log.Printf("[upload] user %s: detected format=%s", userId, format)
 
-		avifData, err := convertToAVIF(data, format)
-		if err != nil {
-			log.Printf("[upload] user %s: AVIF conversion failed: %v", userId, err)
-			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-				"error": "failed to convert image to AVIF",
+		// respond immediately — client will be notified via WebSocket when processing completes
+		log.Printf("[upload] user %s: accepted, processing in background", userId)
+
+		go func() {
+			avifData, err := convertToAVIF(data, format)
+			if err != nil {
+				log.Printf("[upload] user %s: AVIF conversion failed: %v", userId, err)
+				return
+			}
+
+			rawHash := sha256.Sum256(avifData)
+			contentHash := hex.EncodeToString(rawHash[:8])
+			log.Printf("[upload] user %s: content hash=%s", userId, contentHash)
+
+			log.Printf("[upload] user %s: uploading %d bytes to R2 key %q", userId, len(avifData), key)
+			_, err = r2.PutObject(context.TODO(), &s3.PutObjectInput{
+				Bucket:      aws.String(bucket),
+				Key:         aws.String(key),
+				Body:        bytes.NewReader(avifData),
+				ContentType: aws.String("image/avif"),
 			})
-		}
+			if err != nil {
+				log.Printf("[upload] user %s: R2 upload failed: %v", userId, err)
+				return
+			}
 
-		// compute content hash of the final AVIF data
-		rawHash := sha256.Sum256(avifData)
-		contentHash := hex.EncodeToString(rawHash[:8]) // 16 hex chars
-		log.Printf("[upload] user %s: content hash=%s", userId, contentHash)
+			avatars.markExists(userId, contentHash)
+			log.Printf("[upload] user %s: avatar processed and uploaded successfully", userId)
+		}()
 
-		log.Printf("[upload] user %s: uploading %d bytes to R2 key %q", userId, len(avifData), key)
-		_, err = r2.PutObject(context.TODO(), &s3.PutObjectInput{
-			Bucket:      aws.String(bucket),
-			Key:         aws.String(key),
-			Body:        bytes.NewReader(avifData),
-			ContentType: aws.String("image/avif"),
-		})
-		if err != nil {
-			log.Printf("[upload] user %s: R2 upload failed: %v", userId, err)
-			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
-				"error": "failed to upload avatar to storage",
-			})
-		}
-
-		// update the avatar cache so /avatars/check reflects this immediately
-		avatars.markExists(userId, contentHash)
-
-		log.Printf("[upload] user %s: avatar uploaded successfully", userId)
-		return c.Status(fiber.StatusCreated).JSON(fiber.Map{
-			"message": fmt.Sprintf("avatar uploaded for user %s", userId),
+		return c.Status(fiber.StatusAccepted).JSON(fiber.Map{
+			"message": fmt.Sprintf("avatar upload accepted for user %s, processing in background", userId),
 		})
 	})
 
