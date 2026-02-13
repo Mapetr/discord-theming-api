@@ -890,6 +890,65 @@ func main() {
 		})
 	})
 
+	// GET /auth/verify — check if a JWT is valid and whether it has expired.
+	// Requires Authorization: Bearer <token> header.
+	// Response: { "valid": true, "expired": false, "userId": "...", "expiresAt": "..." }
+	app.Get("/auth/verify", func(c fiber.Ctx) error {
+		authHeader := c.Get("Authorization")
+		if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
+			log.Println("[auth] /auth/verify called without Bearer token")
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": "Authorization: Bearer <token> header is required",
+			})
+		}
+
+		tokenString := strings.TrimPrefix(authHeader, "Bearer ")
+
+		// first try: full validation (including expiration)
+		keyFunc := func(t *jwt.Token) (any, error) {
+			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+			}
+			return []byte(jwtSecret), nil
+		}
+
+		token, err := jwt.Parse(tokenString, keyFunc)
+		if err == nil {
+			// token is valid and not expired
+			sub, _ := token.Claims.GetSubject()
+			exp, _ := token.Claims.GetExpirationTime()
+			log.Printf("[auth] verify: valid token for user %s, expires %s", sub, exp.Time)
+			return c.JSON(fiber.Map{
+				"valid":     true,
+				"expired":   false,
+				"userId":    sub,
+				"expiresAt": exp.Time,
+			})
+		}
+
+		// second try: skip claims validation to check if signature is valid but token is expired
+		token, err2 := jwt.Parse(tokenString, keyFunc, jwt.WithoutClaimsValidation())
+		if err2 != nil {
+			// signature invalid or token is malformed
+			log.Printf("[auth] verify: invalid token: %v", err)
+			return c.JSON(fiber.Map{
+				"valid": false,
+				"error": "invalid token",
+			})
+		}
+
+		// signature is valid but token failed standard validation (expired)
+		sub, _ := token.Claims.GetSubject()
+		exp, _ := token.Claims.GetExpirationTime()
+		log.Printf("[auth] verify: expired token for user %s, expired at %s", sub, exp.Time)
+		return c.JSON(fiber.Map{
+			"valid":     true,
+			"expired":   true,
+			"userId":    sub,
+			"expiresAt": exp.Time,
+		})
+	})
+
 	// POST /avatars/check — batch check which user IDs have avatars.
 	// Request body: { "ids": ["123", "456", "789"] }
 	// Response: { "available": { "123": "a1b2c3d4e5f6a7b8", "789": "unknown" } }
