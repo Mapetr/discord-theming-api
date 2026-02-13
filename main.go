@@ -283,6 +283,43 @@ func (ac *avatarCache) markExists(userID string, hash string) {
 	}
 }
 
+// markDeleted removes an asset for a user. Increments version, appends to changelog,
+// rewrites file, and broadcasts with hash="" so WS clients know it was deleted.
+func (ac *avatarCache) markDeleted(userID string) {
+	ac.mu.Lock()
+
+	existing := ac.known[userID]
+	if existing == "" {
+		ac.mu.Unlock()
+		return // nothing to delete
+	}
+
+	ac.known[userID] = ""
+	ac.version++
+	version := ac.version
+
+	ac.changelog = append(ac.changelog, changeEntry{
+		Version: ac.version,
+		UserID:  userID,
+		Hash:    "",
+	})
+
+	if len(ac.changelog) > maxChangelogEntries {
+		ac.changelog = ac.changelog[len(ac.changelog)-maxChangelogEntries:]
+	}
+
+	ac.rewriteFile()
+
+	broadcastFn := ac.broadcastFn
+	ac.mu.Unlock()
+
+	log.Printf("[avatar-cache] deleted %s (version %d)", userID, version)
+
+	if broadcastFn != nil {
+		broadcastFn(version, userID, "")
+	}
+}
+
 // lookup returns (hash, cached). If cached is false, the caller should check R2.
 // hash == "" means negative cache (checked, not found). hash != "" means avatar exists.
 func (ac *avatarCache) lookup(userID string) (hash string, cached bool) {
@@ -333,11 +370,12 @@ func (ac *avatarCache) sync(sinceVersion uint64) (version uint64, changes []chan
 	return
 }
 
-// checkR2 does a HeadObject to see if an avatar exists in R2 for the given user ID.
-func checkR2(r2 *s3.Client, bucket, userID string) bool {
+// checkR2 does a HeadObject to see if an asset exists in R2 for the given user ID.
+// prefix is "avatars" or "banners".
+func checkR2(r2 *s3.Client, bucket, prefix, userID string) bool {
 	_, err := r2.HeadObject(context.TODO(), &s3.HeadObjectInput{
 		Bucket: aws.String(bucket),
-		Key:    aws.String("avatars/" + userID),
+		Key:    aws.String(prefix + "/" + userID),
 	})
 	return err == nil
 }
@@ -900,6 +938,7 @@ func main() {
 
 	pending := newPendingAuth()
 	avatars := newAvatarCache("avatars.txt")
+	banners := newAvatarCache("banners.txt")
 	hub := newWSHub()
 	r2 := newR2Client()
 	app := fiber.New()
@@ -908,6 +947,19 @@ func main() {
 	avatars.broadcastFn = func(version uint64, userID, hash string) {
 		msg, _ := json.Marshal(fiber.Map{
 			"type":    "update",
+			"asset":   "avatar",
+			"version": version,
+			"userId":  userID,
+			"hash":    hash,
+		})
+		hub.broadcast(msg)
+	}
+
+	// wire banner cache mutations to broadcast via WebSocket
+	banners.broadcastFn = func(version uint64, userID, hash string) {
+		msg, _ := json.Marshal(fiber.Map{
+			"type":    "update",
+			"asset":   "banner",
 			"version": version,
 			"userId":  userID,
 			"hash":    hash,
@@ -1058,21 +1110,21 @@ func main() {
 		})
 	})
 
-	// GET /avatars/ws — WebSocket endpoint for real-time avatar updates.
+	// GET /avatars/ws — WebSocket endpoint for real-time avatar and banner updates.
 	// No authentication required. Sends initial full state on connect, then pushes incremental changes.
 	// Compatible with any WebSocket client (e.g. Node.js `ws` package).
 	//
 	// Messages from server (push):
-	//   Initial: { "type": "sync", "version": N, "full": true, "changes": [...] }
-	//   Update:  { "type": "update", "version": N, "userId": "...", "hash": "..." }
+	//   Initial: { "type": "sync", "avatars": { "version": N, "changes": [...] }, "banners": { "version": N, "changes": [...] } }
+	//   Update:  { "type": "update", "asset": "avatar"|"banner", "version": N, "userId": "...", "hash": "..." }
 	//   Error:   { "type": "error", "error": "..." }
 	//
 	// Client can send:
 	//   Ping:    { "type": "ping" }
 	//            -> { "type": "pong" }
 	//
-	//   Check:   { "type": "check", "ids": ["123", "456"] }
-	//            -> { "type": "check", "available": { "123": "hash", "456": "hash" } }
+	//   Check:   { "type": "check", "asset": "avatar"|"banner", "ids": ["123", "456"] }
+	//            -> { "type": "check", "asset": "avatar"|"banner", "available": { "123": "hash" } }
 	//
 	//   Verify:  { "type": "verify", "token": "<jwt>" }
 	//            -> { "type": "verify", "valid": true, "expired": false, "userId": "...", "expiresAt": "..." }
@@ -1081,21 +1133,29 @@ func main() {
 		hub.register(c)
 		defer hub.unregister(c)
 
-		// send initial full snapshot
-		version, changes, _ := avatars.sync(0)
+		// send initial full snapshot of both avatars and banners
 		type syncChange struct {
 			UserID string `json:"userId"`
 			Hash   string `json:"hash"`
 		}
-		respChanges := make([]syncChange, len(changes))
-		for i, ch := range changes {
-			respChanges[i] = syncChange{UserID: ch.UserID, Hash: ch.Hash}
+		type assetSync struct {
+			Version uint64       `json:"version"`
+			Changes []syncChange `json:"changes"`
 		}
+
+		buildSync := func(ac *avatarCache) assetSync {
+			version, changes, _ := ac.sync(0)
+			sc := make([]syncChange, len(changes))
+			for i, ch := range changes {
+				sc[i] = syncChange{UserID: ch.UserID, Hash: ch.Hash}
+			}
+			return assetSync{Version: version, Changes: sc}
+		}
+
 		initMsg, _ := json.Marshal(fiber.Map{
 			"type":    "sync",
-			"version": version,
-			"full":    true,
-			"changes": respChanges,
+			"avatars": buildSync(avatars),
+			"banners": buildSync(banners),
 		})
 		if err := c.WriteMessage(websocket.TextMessage, initMsg); err != nil {
 			log.Printf("[ws] failed to send initial sync: %v", err)
@@ -1111,6 +1171,7 @@ func main() {
 
 			var clientMsg struct {
 				Type  string   `json:"type"`
+				Asset string   `json:"asset,omitempty"` // "avatar" or "banner", defaults to "avatar"
 				IDs   []string `json:"ids,omitempty"`
 				Token string   `json:"token,omitempty"`
 			}
@@ -1125,15 +1186,32 @@ func main() {
 				reply, _ = json.Marshal(fiber.Map{"type": "pong"})
 
 			case "check":
+				// pick the right cache and R2 prefix based on asset type
+				assetType := clientMsg.Asset
+				if assetType == "" {
+					assetType = "avatar"
+				}
+				var cache *avatarCache
+				var prefix string
+				switch assetType {
+				case "banner":
+					cache = banners
+					prefix = "banners"
+				default:
+					cache = avatars
+					prefix = "avatars"
+					assetType = "avatar"
+				}
+
 				available := make(map[string]string)
 				for _, id := range clientMsg.IDs {
-					hash, cached := avatars.lookup(id)
+					hash, cached := cache.lookup(id)
 					if !cached {
-						exists := checkR2(r2, bucket, id)
+						exists := checkR2(r2, bucket, prefix, id)
 						if exists {
 							hash = "unknown"
 						}
-						avatars.setChecked(id, hash)
+						cache.setChecked(id, hash)
 					}
 					if hash != "" {
 						available[id] = hash
@@ -1141,6 +1219,7 @@ func main() {
 				}
 				reply, _ = json.Marshal(fiber.Map{
 					"type":      "check",
+					"asset":     assetType,
 					"available": available,
 				})
 
@@ -1306,6 +1385,199 @@ func main() {
 
 		return c.Status(fiber.StatusAccepted).JSON(fiber.Map{
 			"message": fmt.Sprintf("avatar upload accepted for user %s, processing in background", userId),
+		})
+	})
+
+	// DELETE /avatars/:userId — remove a user's avatar from R2 and broadcast deletion.
+	app.Delete("/avatars/:userId", func(c fiber.Ctx) error {
+		userId := c.Params("userId")
+		log.Printf("[delete] DELETE /avatars/%s - request received", userId)
+
+		authHeader := c.Get("Authorization")
+		if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+				"error": "authorization required",
+			})
+		}
+
+		tokenString := strings.TrimPrefix(authHeader, "Bearer ")
+		tokenUserID, err := verifyJWT(tokenString, jwtSecret)
+		if err != nil {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+				"error": "invalid or expired token",
+			})
+		}
+
+		if tokenUserID != userId {
+			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+				"error": "you can only delete your own avatar",
+			})
+		}
+
+		_, err = r2.DeleteObject(context.TODO(), &s3.DeleteObjectInput{
+			Bucket: aws.String(bucket),
+			Key:    aws.String("avatars/" + userId),
+		})
+		if err != nil {
+			log.Printf("[delete] user %s: R2 delete failed: %v", userId, err)
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "failed to delete avatar from storage",
+			})
+		}
+
+		avatars.markDeleted(userId)
+		log.Printf("[delete] user %s: avatar deleted successfully", userId)
+		return c.JSON(fiber.Map{
+			"message": fmt.Sprintf("avatar deleted for user %s", userId),
+		})
+	})
+
+	// POST /banners/:userId — upload a profile banner (same flow as avatars).
+	app.Post("/banners/:userId", func(c fiber.Ctx) error {
+		userId := c.Params("userId")
+		log.Printf("[upload] POST /banners/%s - request received", userId)
+
+		authHeader := c.Get("Authorization")
+		if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
+			log.Printf("[upload] banner user %s: missing or invalid Authorization header", userId)
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+				"error": "authorization required",
+			})
+		}
+
+		tokenString := strings.TrimPrefix(authHeader, "Bearer ")
+		tokenUserID, err := verifyJWT(tokenString, jwtSecret)
+		if err != nil {
+			log.Printf("[upload] banner user %s: invalid token: %v", userId, err)
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+				"error": "invalid or expired token",
+			})
+		}
+
+		if tokenUserID != userId {
+			log.Printf("[upload] banner user %s: token belongs to %s, rejecting", userId, tokenUserID)
+			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+				"error": "you can only upload to your own profile",
+			})
+		}
+
+		log.Printf("[upload] banner user %s: authenticated successfully", userId)
+
+		file, err := c.FormFile("banner")
+		if err != nil {
+			log.Printf("[upload] banner user %s: no banner field in form: %v", userId, err)
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": "banner file is required",
+			})
+		}
+
+		log.Printf("[upload] banner user %s: received file %q, size: %d bytes, content-type: %s",
+			userId, file.Filename, file.Size, file.Header.Get("Content-Type"))
+
+		key := "banners/" + userId
+
+		src, err := file.Open()
+		if err != nil {
+			log.Printf("[upload] banner user %s: failed to open multipart file: %v", userId, err)
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "failed to read uploaded file",
+			})
+		}
+		defer src.Close()
+
+		data, err := io.ReadAll(src)
+		if err != nil {
+			log.Printf("[upload] banner user %s: failed to read file bytes: %v", userId, err)
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "failed to read uploaded file",
+			})
+		}
+		log.Printf("[upload] banner user %s: read %d bytes from upload", userId, len(data))
+
+		format, err := detectFormat(data)
+		if err != nil {
+			log.Printf("[upload] banner user %s: unsupported format: %v", userId, err)
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+				"error": "unsupported file format — accepted: PNG, JPG, GIF, WebP, AVIF, MP4",
+			})
+		}
+		log.Printf("[upload] banner user %s: detected format=%s", userId, format)
+
+		log.Printf("[upload] banner user %s: accepted, processing in background", userId)
+
+		go func() {
+			avifData, err := convertToAVIF(data, format)
+			if err != nil {
+				log.Printf("[upload] banner user %s: AVIF conversion failed: %v", userId, err)
+				return
+			}
+
+			rawHash := sha256.Sum256(avifData)
+			contentHash := hex.EncodeToString(rawHash[:8])
+			log.Printf("[upload] banner user %s: content hash=%s", userId, contentHash)
+
+			log.Printf("[upload] banner user %s: uploading %d bytes to R2 key %q", userId, len(avifData), key)
+			_, err = r2.PutObject(context.TODO(), &s3.PutObjectInput{
+				Bucket:      aws.String(bucket),
+				Key:         aws.String(key),
+				Body:        bytes.NewReader(avifData),
+				ContentType: aws.String("image/avif"),
+			})
+			if err != nil {
+				log.Printf("[upload] banner user %s: R2 upload failed: %v", userId, err)
+				return
+			}
+
+			banners.markExists(userId, contentHash)
+			log.Printf("[upload] banner user %s: banner processed and uploaded successfully", userId)
+		}()
+
+		return c.Status(fiber.StatusAccepted).JSON(fiber.Map{
+			"message": fmt.Sprintf("banner upload accepted for user %s, processing in background", userId),
+		})
+	})
+
+	// DELETE /banners/:userId — remove a user's banner from R2 and broadcast deletion.
+	app.Delete("/banners/:userId", func(c fiber.Ctx) error {
+		userId := c.Params("userId")
+		log.Printf("[delete] DELETE /banners/%s - request received", userId)
+
+		authHeader := c.Get("Authorization")
+		if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+				"error": "authorization required",
+			})
+		}
+
+		tokenString := strings.TrimPrefix(authHeader, "Bearer ")
+		tokenUserID, err := verifyJWT(tokenString, jwtSecret)
+		if err != nil {
+			return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+				"error": "invalid or expired token",
+			})
+		}
+
+		if tokenUserID != userId {
+			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+				"error": "you can only delete your own banner",
+			})
+		}
+
+		_, err = r2.DeleteObject(context.TODO(), &s3.DeleteObjectInput{
+			Bucket: aws.String(bucket),
+			Key:    aws.String("banners/" + userId),
+		})
+		if err != nil {
+			log.Printf("[delete] user %s: R2 banner delete failed: %v", userId, err)
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"error": "failed to delete banner from storage",
+			})
+		}
+
+		banners.markDeleted(userId)
+		log.Printf("[delete] user %s: banner deleted successfully", userId)
+		return c.JSON(fiber.Map{
+			"message": fmt.Sprintf("banner deleted for user %s", userId),
 		})
 	})
 
