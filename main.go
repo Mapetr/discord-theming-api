@@ -88,25 +88,67 @@ func (pa *pendingAuth) cleanup() {
 }
 
 // avatarCache tracks which user IDs have uploaded avatars.
-// true = avatar exists, false = checked R2 and not found.
-// Unknown IDs are checked against R2 on demand and cached.
+// Positive entries (avatar exists) are persisted to a file and loaded on startup.
+// Negative entries (checked R2, not found) are in-memory only.
 type avatarCache struct {
-	mu    sync.RWMutex
-	known map[string]bool // userId -> exists
+	mu       sync.RWMutex
+	known    map[string]bool // userId -> exists
+	filePath string
 }
 
-func newAvatarCache() *avatarCache {
-	return &avatarCache{
-		known: make(map[string]bool),
+func newAvatarCache(filePath string) *avatarCache {
+	ac := &avatarCache{
+		known:    make(map[string]bool),
+		filePath: filePath,
 	}
+
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			log.Printf("[avatar-cache] no cache file at %s, starting empty", filePath)
+		} else {
+			log.Printf("[avatar-cache] failed to read cache file %s: %v", filePath, err)
+		}
+		return ac
+	}
+
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	for _, line := range lines {
+		id := strings.TrimSpace(line)
+		if id != "" {
+			ac.known[id] = true
+		}
+	}
+	log.Printf("[avatar-cache] loaded %d user IDs from %s", len(ac.known), filePath)
+
+	return ac
 }
 
 // markExists marks a user as having an avatar (called after successful upload).
+// Persists the ID to disk if it wasn't already cached.
 func (ac *avatarCache) markExists(userID string) {
 	ac.mu.Lock()
 	defer ac.mu.Unlock()
+
+	if ac.known[userID] {
+		return
+	}
+
 	ac.known[userID] = true
-	log.Printf("[avatar-cache] marked %s as exists", userID)
+
+	f, err := os.OpenFile(ac.filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Printf("[avatar-cache] failed to open cache file for append: %v", err)
+		return
+	}
+	defer f.Close()
+
+	if _, err := f.WriteString(userID + "\n"); err != nil {
+		log.Printf("[avatar-cache] failed to write user ID to cache file: %v", err)
+		return
+	}
+
+	log.Printf("[avatar-cache] marked %s as exists (persisted)", userID)
 }
 
 // lookup returns (exists, cached). If cached is false, the caller should check R2.
@@ -690,7 +732,7 @@ func main() {
 	log.Printf("[config] Discord OAuth configured, redirect URI: %s", discordRedirectURI)
 
 	pending := newPendingAuth()
-	avatars := newAvatarCache()
+	avatars := newAvatarCache("avatars.txt")
 	r2 := newR2Client()
 	app := fiber.New()
 
