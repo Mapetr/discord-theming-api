@@ -466,6 +466,8 @@ func convertToAVIF(input []byte, format string) ([]byte, error) {
 }
 
 // convertStaticToAVIF converts a static image (PNG, JPG, static WebP) to a still AVIF.
+// PNG may have transparency, so it uses the two-stream alpha approach.
+// JPG and static WebP have no alpha, so they use a simple single-stream encode.
 func convertStaticToAVIF(input []byte, ext string) ([]byte, error) {
 	tmpDir, err := os.MkdirTemp("", "avif-static-*")
 	if err != nil {
@@ -483,17 +485,38 @@ func convertStaticToAVIF(input []byte, ext string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "ffmpeg", "-y",
-		"-i", inPath,
-		"-c:v", "libaom-av1",
-		"-crf", "30",
-		"-still-picture", "1",
-		outPath,
-	)
+	var cmd *exec.Cmd
+	if ext == "png" {
+		// PNG may have alpha — use two-stream approach (color + alpha as separate AV1 streams)
+		cmd = exec.CommandContext(ctx, "ffmpeg", "-y",
+			"-i", inPath,
+			"-filter_complex", "[0:v]format=pix_fmts=yuva444p,split[main][alpha];[alpha]alphaextract[alpha]",
+			"-map", "[main]:v",
+			"-map", "[alpha]:v",
+			"-pix_fmt:0", "yuv420p",
+			"-pix_fmt:1", "gray8",
+			"-c:v", "libaom-av1",
+			"-crf", "30",
+			"-crf:1", "40",
+			"-still-picture", "1",
+			outPath,
+		)
+		log.Printf("[ffmpeg] converting PNG to AVIF (two-stream: color yuv420p + alpha gray8, still-picture)")
+	} else {
+		// JPG and static WebP have no alpha — simple single-stream encode
+		cmd = exec.CommandContext(ctx, "ffmpeg", "-y",
+			"-i", inPath,
+			"-c:v", "libaom-av1",
+			"-crf", "30",
+			"-still-picture", "1",
+			outPath,
+		)
+		log.Printf("[ffmpeg] converting %s to AVIF (single-stream, still-picture)", ext)
+	}
+
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
-	log.Printf("[ffmpeg] running: ffmpeg -y -i input.%s -c:v libaom-av1 -crf 30 -still-picture 1 output.avif", ext)
 	if err := cmd.Run(); err != nil {
 		return nil, fmt.Errorf("ffmpeg static conversion failed: %w: %s", err, stderr.String())
 	}
@@ -502,7 +525,8 @@ func convertStaticToAVIF(input []byte, ext string) ([]byte, error) {
 }
 
 // convertGIFToAVIF converts a GIF (static or animated) to AVIF using ffmpeg.
-// Uses -vsync vfr to preserve original per-frame timing and yuva420p for transparency.
+// Uses two-stream encoding: stream 0 = color (yuv420p), stream 1 = alpha (gray8).
+// libaom-av1 does not support yuva420p, so alpha must be a separate AV1 stream.
 func convertGIFToAVIF(input []byte) ([]byte, error) {
 	tmpDir, err := os.MkdirTemp("", "avif-gif-*")
 	if err != nil {
@@ -520,23 +544,29 @@ func convertGIFToAVIF(input []byte) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// GIF uses pal8 with 1-bit transparency. We need to:
-	// 1. Decode to rgba to get proper alpha channel
-	// 2. Use yuva420p to preserve alpha in output
-	// 3. Use vfr to preserve per-frame timing
+	// GIF uses pal8 with 1-bit transparency. AVIF requires alpha as a separate
+	// grayscale AV1 stream. We use filter_complex to:
+	// 1. Convert to yuva444p to get full alpha channel
+	// 2. Split into two copies
+	// 3. Extract alpha channel as grayscale from the second copy
+	// Stream 0 (color) uses yuv420p, stream 1 (alpha) uses gray8.
 	cmd := exec.CommandContext(ctx, "ffmpeg", "-y",
 		"-i", inPath,
-		"-vf", "format=rgba",
+		"-filter_complex", "[0:v]format=pix_fmts=yuva444p,split[main][alpha];[alpha]alphaextract[alpha]",
+		"-map", "[main]:v",
+		"-map", "[alpha]:v",
+		"-pix_fmt:0", "yuv420p",
+		"-pix_fmt:1", "gray8",
 		"-c:v", "libaom-av1",
 		"-crf", "30",
-		"-pix_fmt", "yuva420p",
+		"-crf:1", "40",
 		"-vsync", "vfr",
 		outPath,
 	)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
-	log.Printf("[ffmpeg] converting GIF to AVIF (rgba→yuva420p + vfr)")
+	log.Printf("[ffmpeg] converting GIF to AVIF (two-stream: color yuv420p + alpha gray8)")
 	if err := cmd.Run(); err != nil {
 		return nil, fmt.Errorf("ffmpeg GIF conversion failed: %w: %s", err, stderr.String())
 	}
