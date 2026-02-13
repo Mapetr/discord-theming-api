@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -87,18 +89,18 @@ func (pa *pendingAuth) cleanup() {
 	}
 }
 
-// avatarCache tracks which user IDs have uploaded avatars.
-// Positive entries (avatar exists) are persisted to a file and loaded on startup.
-// Negative entries (checked R2, not found) are in-memory only.
+// avatarCache tracks which user IDs have uploaded avatars and their content hashes.
+// Positive entries (hash != "") are persisted to a file and loaded on startup.
+// Negative entries (hash == "", checked R2 and not found) are in-memory only.
 type avatarCache struct {
 	mu       sync.RWMutex
-	known    map[string]bool // userId -> exists
+	known    map[string]string // userId -> content hash ("" = not found, non-empty = exists)
 	filePath string
 }
 
 func newAvatarCache(filePath string) *avatarCache {
 	ac := &avatarCache{
-		known:    make(map[string]bool),
+		known:    make(map[string]string),
 		filePath: filePath,
 	}
 
@@ -114,9 +116,16 @@ func newAvatarCache(filePath string) *avatarCache {
 
 	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
 	for _, line := range lines {
-		id := strings.TrimSpace(line)
-		if id != "" {
-			ac.known[id] = true
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) == 2 {
+			ac.known[parts[0]] = parts[1]
+		} else {
+			// legacy format: bare userId without hash
+			ac.known[parts[0]] = "unknown"
 		}
 	}
 	log.Printf("[avatar-cache] loaded %d user IDs from %s", len(ac.known), filePath)
@@ -124,17 +133,17 @@ func newAvatarCache(filePath string) *avatarCache {
 	return ac
 }
 
-// markExists marks a user as having an avatar (called after successful upload).
-// Persists the ID to disk if it wasn't already cached.
-func (ac *avatarCache) markExists(userID string) {
+// markExists marks a user as having an avatar with the given content hash.
+// Persists to disk. Skips write if the hash hasn't changed.
+func (ac *avatarCache) markExists(userID string, hash string) {
 	ac.mu.Lock()
 	defer ac.mu.Unlock()
 
-	if ac.known[userID] {
+	if ac.known[userID] == hash {
 		return
 	}
 
-	ac.known[userID] = true
+	ac.known[userID] = hash
 
 	f, err := os.OpenFile(ac.filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
@@ -143,27 +152,29 @@ func (ac *avatarCache) markExists(userID string) {
 	}
 	defer f.Close()
 
-	if _, err := f.WriteString(userID + "\n"); err != nil {
-		log.Printf("[avatar-cache] failed to write user ID to cache file: %v", err)
+	if _, err := f.WriteString(userID + ":" + hash + "\n"); err != nil {
+		log.Printf("[avatar-cache] failed to write to cache file: %v", err)
 		return
 	}
 
-	log.Printf("[avatar-cache] marked %s as exists (persisted)", userID)
+	log.Printf("[avatar-cache] marked %s with hash %s (persisted)", userID, hash)
 }
 
-// lookup returns (exists, cached). If cached is false, the caller should check R2.
-func (ac *avatarCache) lookup(userID string) (exists bool, cached bool) {
+// lookup returns (hash, cached). If cached is false, the caller should check R2.
+// hash == "" means negative cache (checked, not found). hash != "" means avatar exists.
+func (ac *avatarCache) lookup(userID string) (hash string, cached bool) {
 	ac.mu.RLock()
 	defer ac.mu.RUnlock()
-	exists, cached = ac.known[userID]
+	hash, cached = ac.known[userID]
 	return
 }
 
 // setChecked caches the result of an R2 check for a user ID.
-func (ac *avatarCache) setChecked(userID string, exists bool) {
+// Pass "unknown" for positive results (no hash available), "" for negative results.
+func (ac *avatarCache) setChecked(userID string, hash string) {
 	ac.mu.Lock()
 	defer ac.mu.Unlock()
-	ac.known[userID] = exists
+	ac.known[userID] = hash
 }
 
 // checkR2 does a HeadObject to see if an avatar exists in R2 for the given user ID.
@@ -881,7 +892,7 @@ func main() {
 
 	// POST /avatars/check — batch check which user IDs have avatars.
 	// Request body: { "ids": ["123", "456", "789"] }
-	// Response: { "available": ["123", "789"] }
+	// Response: { "available": { "123": "a1b2c3d4e5f6a7b8", "789": "unknown" } }
 	app.Post("/avatars/check", func(c fiber.Ctx) error {
 		var body struct {
 			IDs []string `json:"ids"`
@@ -895,17 +906,20 @@ func main() {
 
 		log.Printf("[check] checking %d user IDs", len(body.IDs))
 
-		available := make([]string, 0)
+		available := make(map[string]string)
 		for _, id := range body.IDs {
-			exists, cached := avatars.lookup(id)
+			hash, cached := avatars.lookup(id)
 			if !cached {
 				// not in cache yet, check R2
-				exists = checkR2(r2, bucket, id)
-				avatars.setChecked(id, exists)
+				exists := checkR2(r2, bucket, id)
+				if exists {
+					hash = "unknown"
+				}
+				avatars.setChecked(id, hash)
 				log.Printf("[check] R2 lookup for %s: exists=%v", id, exists)
 			}
-			if exists {
-				available = append(available, id)
+			if hash != "" {
+				available[id] = hash
 			}
 		}
 
@@ -994,6 +1008,11 @@ func main() {
 			})
 		}
 
+		// compute content hash of the final AVIF data
+		rawHash := sha256.Sum256(avifData)
+		contentHash := hex.EncodeToString(rawHash[:8]) // 16 hex chars
+		log.Printf("[upload] user %s: content hash=%s", userId, contentHash)
+
 		log.Printf("[upload] user %s: uploading %d bytes to R2 key %q", userId, len(avifData), key)
 		_, err = r2.PutObject(context.TODO(), &s3.PutObjectInput{
 			Bucket:      aws.String(bucket),
@@ -1009,7 +1028,7 @@ func main() {
 		}
 
 		// update the avatar cache so /avatars/check reflects this immediately
-		avatars.markExists(userId)
+		avatars.markExists(userId, contentHash)
 
 		log.Printf("[upload] user %s: avatar uploaded successfully", userId)
 		return c.Status(fiber.StatusCreated).JSON(fiber.Map{
